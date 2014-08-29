@@ -1,0 +1,182 @@
+diff --git a/etc/policy.v3cloudsample.json b/etc/policy.v3cloudsample.json
+index 2803559..a24c7e5 100644
+--- a/etc/policy.v3cloudsample.json
++++ b/etc/policy.v3cloudsample.json
+@@ -1,6 +1,6 @@
+ {
+     "admin_required": "role:admin",
+-    "cloud_admin": "rule:admin_required and domain_id:admin_domain_id",
++    "cloud_admin": "rule:admin_required and domain_id:default",
+     "service_role": "role:service",
+     "service_or_admin": "rule:admin_required or rule:service_role",
+     "owner" : "user_id:%(user_id)s or user_id:%(target.token.user_id)s",
+@@ -28,8 +28,8 @@
+     "identity:update_endpoint": "rule:cloud_admin",
+     "identity:delete_endpoint": "rule:cloud_admin",
+ 
+-    "identity:get_domain": "rule:cloud_admin",
+-    "identity:list_domains": "rule:cloud_admin",
++    "identity:get_domain": "rule:cloud_admin or domain_id:%(target.domain.id)s",
++    "identity:list_domains": "rule:cloud_admin or domain_id:%(target.domain.id)s",
+     "identity:create_domain": "rule:cloud_admin",
+     "identity:update_domain": "rule:cloud_admin",
+     "identity:delete_domain": "rule:cloud_admin",
+@@ -37,8 +37,8 @@
+     "admin_and_matching_target_project_domain_id": "rule:admin_required and domain_id:%(target.project.domain_id)s",
+     "admin_and_matching_project_domain_id": "rule:admin_required and domain_id:%(project.domain_id)s",
+     "identity:get_project": "rule:cloud_admin or rule:admin_and_matching_target_project_domain_id",
+-    "identity:list_projects": "rule:admin_required and domain_id:%(domain_id)s",
+-    "identity:list_user_projects": "rule:owner or rule:admin_and_matching_domain_id",
++    "identity:list_projects": "(rule:admin_required and domain_id:%(domain_id)s) or rule:cloud_admin",
++    "identity:list_user_projects": "rule:owner or rule:admin_and_matching_domain_id or rule:cloud_admin",
+     "identity:create_project": "rule:cloud_admin or rule:admin_and_matching_project_domain_id",
+     "identity:update_project": "rule:cloud_admin or rule:admin_and_matching_target_project_domain_id",
+     "identity:delete_project": "rule:cloud_admin or rule:admin_and_matching_target_project_domain_id",
+@@ -46,7 +46,7 @@
+     "admin_and_matching_target_user_domain_id": "rule:admin_required and domain_id:%(target.user.domain_id)s",
+     "admin_and_matching_user_domain_id": "rule:admin_required and domain_id:%(user.domain_id)s",
+     "identity:get_user": "rule:cloud_admin or rule:admin_and_matching_target_user_domain_id",
+-    "identity:list_users": "rule:cloud_admin or rule:admin_and_matching_domain_id",
++    "identity:list_users": "rule:admin_required",
+     "identity:create_user": "rule:cloud_admin or rule:admin_and_matching_user_domain_id",
+     "identity:update_user": "rule:cloud_admin or rule:admin_and_matching_target_user_domain_id",
+     "identity:delete_user": "rule:cloud_admin or rule:admin_and_matching_target_user_domain_id",
+@@ -88,8 +88,9 @@
+     "identity:create_grant": "rule:cloud_admin or rule:domain_admin_for_grants or rule:project_admin_for_grants",
+     "identity:revoke_grant": "rule:cloud_admin or rule:domain_admin_for_grants or rule:project_admin_for_grants",
+ 
++
+     "admin_on_domain_filter" : "rule:cloud_admin or (rule:admin_required and domain_id:%(scope.domain.id)s)",
+-    "admin_on_project_filter" : "rule:cloud_admin or (rule:admin_required and project_id:%(scope.project.id)s)",
++    "admin_on_project_filter" : "rule:cloud_admin or (rule:admin_required and (project_id:%(scope.project.id)s or domain_id:%(target.project.domain_id)s))",
+     "identity:list_role_assignments": "rule:admin_on_domain_filter or rule:admin_on_project_filter",
+ 
+     "identity:get_policy": "rule:cloud_admin",
+diff --git a/keystone/assignment/controllers.py b/keystone/assignment/controllers.py
+index 17cf8d8..1d48ba1 100644
+--- a/keystone/assignment/controllers.py
++++ b/keystone/assignment/controllers.py
+@@ -359,7 +359,16 @@ class DomainV3(controller.V3Controller):
+         ref = self.assignment_api.create_domain(ref['id'], ref)
+         return DomainV3.wrap_member(context, ref)
+ 
+-    @controller.filterprotected('enabled', 'name')
++    def _list_domain_protection(self, context):
++        #if domain is requested by name - add it to target
++        ref = {}
++        name = context['query_string'].get('name')
++        if name is not None:
++            ref['domain'] = self.assignment_api.get_domain_by_name(name)
++        return ref
++
++    @controller.filterprotected_with_callback(_list_domain_protection,
++                                              'enabled', 'name')
+     def list_domains(self, context, filters):
+         hints = DomainV3.build_driver_hints(context, filters)
+         refs = self.assignment_api.list_domains(hints=hints)
+@@ -507,7 +516,6 @@ class RoleV3(controller.V3Controller):
+             ref['domain'] = self.assignment_api.get_domain(domain_id)
+         else:
+             ref['project'] = self.assignment_api.get_project(project_id)
+-
+         self.check_protection(context, protection, ref)
+ 
+     @controller.protected(callback=_check_grant_protection)
+@@ -851,9 +859,19 @@ class RoleAssignmentV3(controller.V3Controller):
+         else:
+             return True
+ 
+-    @controller.filterprotected('group.id', 'role.id',
+-                                'scope.domain.id', 'scope.project.id',
+-                                'scope.OS-INHERIT:inherited_to', 'user.id')
++    def _check_list_role_assignments(self, context):
++        project_id = context['query_string'].get('scope.project.id')
++        target = {}
++        if project_id is not None:
++            target['project'] = self.assignment_api.get_project(
++                context['query_string']['scope.project.id'])
++        return target
++
++
++    @controller.filterprotected_with_callback(
++        _check_list_role_assignments,
++        'group.id', 'role.id', 'scope.domain.id', 'scope.project.id',
++        'scope.OS-INHERIT:inherited_to', 'user.id')
+     def list_role_assignments(self, context, filters):
+ 
+         # TODO(henry-nash): This implementation uses the standard filtering
+@@ -861,7 +879,6 @@ class RoleAssignmentV3(controller.V3Controller):
+         # assignments, this is pretty inefficient.  An alternative would be
+         # to pass the filters into the driver call, so that the list size is
+         # kept a minimum.
+-
+         hints = self.build_driver_hints(context, filters)
+         refs = self.assignment_api.list_role_assignments()
+         formatted_refs = (
+diff --git a/keystone/common/controller.py b/keystone/common/controller.py
+index c117b8b..1f039a2 100644
+--- a/keystone/common/controller.py
++++ b/keystone/common/controller.py
+@@ -156,6 +156,11 @@ def protected(callback=None):
+ 
+ def filterprotected(*filters):
+     """Wraps filtered API calls with role based access controls (RBAC)."""
++    return filterprotected_with_callback(None, *filters)
++
++
++def filterprotected_with_callback(callback, *filters):
++    """Wraps filtered API calls with role based access controls (RBAC)."""
+ 
+     def _filterprotected(f):
+         @functools.wraps(f)
+@@ -173,6 +178,7 @@ def filterprotected(*filters):
+                 #
+                 # First  any query filter parameters
+                 target = dict()
++
+                 if filters:
+                     for item in filters:
+                         if item in context['query_string']:
+@@ -185,7 +191,8 @@ def filterprotected(*filters):
+                 # Now any formal url parameters
+                 for key in kwargs:
+                     target[key] = kwargs[key]
+-
++                if callback is not None:
++                    target['target'] = callback(self, context, **kwargs)
+                 self.policy_api.enforce(creds,
+                                         action,
+                                         authorization.flatten(target))
+diff --git a/keystone/openstack/common/policy.py b/keystone/openstack/common/policy.py
+index b1b05b4..198b43f 100644
+--- a/keystone/openstack/common/policy.py
++++ b/keystone/openstack/common/policy.py
+@@ -839,6 +839,15 @@ class HttpCheck(Check):
+ @register(None)
+ class GenericCheck(Check):
+     def __call__(self, target, creds, enforcer):
++	ret = self.old_call(target, creds, enforcer)
++	if not ret:
++            LOG.debug('Target: %s', repr(target))
++            LOG.debug('Match: %s', repr(self.match))
++            LOG.debug('Creds: %s', repr(creds))
++            LOG.debug('Kind: %s', repr(self.kind))
++        return ret
++
++    def old_call(self, target, creds, enforcer):
+         """Check an individual match.
+ 
+         Matches look like:
+@@ -848,7 +857,6 @@ class GenericCheck(Check):
+             True:%(user.enabled)s
+             'Member':%(role.name)s
+         """
+-
+         # TODO(termie): do dict inspection via dot syntax
+         try:
+             match = self.match % target
+@@ -866,3 +874,4 @@ class GenericCheck(Check):
+             except KeyError:
+                 return False
+         return match == six.text_type(leftval)
++        
